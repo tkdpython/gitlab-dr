@@ -1,6 +1,10 @@
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import zipfile
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 
 import pyzipper
 import requests
@@ -10,9 +14,34 @@ class GitLabDRError(Exception):
     pass
 
 
+def _log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+class RunReport:
+    def __init__(self):
+        self.warnings = []
+
+    def warn(self, msg):
+        _log("warning: " + msg)
+        self.warnings.append(msg)
+
+    def print_summary(self):
+        _log("")
+        if not self.warnings:
+            _log("summary: completed with no warnings")
+            return
+        _log("summary: %d warning(s):" % len(self.warnings))
+        for w in self.warnings:
+            _log("  - " + w)
+
+
 class GitLabClient(object):
     def __init__(self, base_url, token, cert=None, verify=True, timeout=30):
         self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.cert = cert
+        self.verify = verify
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"PRIVATE-TOKEN": token})
@@ -34,10 +63,7 @@ class GitLabClient(object):
         if expected is None:
             expected = (200,)
         if response.status_code not in expected:
-            raise GitLabDRError(
-                "GitLab API %s %s failed: %s %s"
-                % (method, path, response.status_code, response.text)
-            )
+            raise GitLabDRError("GitLab API %s %s failed: %s %s" % (method, path, response.status_code, response.text))
         if response.status_code == 204:
             return None
         content_type = response.headers.get("Content-Type", "")
@@ -52,15 +78,21 @@ class GitLabClient(object):
         params.setdefault("per_page", 100)
         while True:
             params["page"] = page
-            response = self.session.get(
-                self._url(path), params=params, timeout=self.timeout
-            )
+            response = self.session.get(self._url(path), params=params, timeout=self.timeout)
             if response.status_code != 200:
+                raise GitLabDRError("GitLab API GET %s failed: %s %s" % (path, response.status_code, response.text))
+            if not response.text:
                 raise GitLabDRError(
-                    "GitLab API GET %s failed: %s %s"
-                    % (path, response.status_code, response.text)
+                    "GitLab API GET %s returned status %s with empty body "
+                    "(check base URL, token, and certificate)" % (path, response.status_code)
                 )
-            items = response.json()
+            try:
+                items = response.json()
+            except ValueError as exc:
+                raise GitLabDRError(
+                    "GitLab API GET %s returned non-JSON response (status %s): %s"
+                    % (path, response.status_code, response.text[:500])
+                ) from exc
             all_items.extend(items)
             next_page = response.headers.get("X-Next-Page")
             if next_page:
@@ -94,6 +126,9 @@ class GitLabClient(object):
 
     def group_members(self, group_id):
         return self.list_paginated("/groups/%s/members/all" % group_id)
+
+    def list_subgroups(self, group_id):
+        return self.list_paginated("/groups/%s/subgroups" % group_id)
 
     def group_projects(self, group_id):
         return self.list_paginated(
@@ -181,8 +216,129 @@ class GitLabClient(object):
             )
 
 
+def _git_env(cert=None, verify=True):
+    """Return a subprocess environment dict with git SSL settings applied."""
+    env = os.environ.copy()
+    if cert:
+        env["GIT_SSL_CERT"] = cert[0]
+        env["GIT_SSL_KEY"] = cert[1]
+    if isinstance(verify, str):
+        env["GIT_SSL_CAINFO"] = verify
+    elif not verify:
+        env["GIT_SSL_NO_VERIFY"] = "1"
+    return env
+
+
+def _git_clone_url(base_url, project_path_with_namespace, token):
+    """Build an authenticated HTTPS git clone URL."""
+    parsed = urlparse(base_url)
+    netloc = "oauth2:%s@%s" % (token, parsed.hostname)
+    if parsed.port:
+        netloc += ":%d" % parsed.port
+    path = "/%s.git" % project_path_with_namespace.lstrip("/")
+    return urlunparse((parsed.scheme, netloc, path, "", "", ""))
+
+
+def _run_git(args, env, cwd=None):
+    result = subprocess.run(
+        ["git"] + args,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result
+
+
+def _bundle_project(project_path, clone_url, git_env):
+    """Mirror-clone a project and return its git bundle bytes, or None if the repo is empty."""
+    _log("  cloning %s ..." % project_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mirror_dir = os.path.join(tmpdir, "mirror")
+        result = _run_git(["clone", "--mirror", clone_url, mirror_dir], git_env)
+        if result.returncode != 0:
+            raise GitLabDRError(
+                "git clone failed for %s: %s" % (project_path, result.stderr.decode(errors="replace").strip())
+            )
+        # Check for at least one ref — empty repos cannot be bundled
+        ref_check = _run_git(["for-each-ref", "--count=1"], git_env, cwd=mirror_dir)
+        if not ref_check.stdout.strip():
+            _log("  skipping %s (empty repository)" % project_path)
+            return None
+        bundle_path = os.path.join(tmpdir, "repo.bundle")
+        result = _run_git(["bundle", "create", bundle_path, "--all"], git_env, cwd=mirror_dir)
+        if result.returncode != 0:
+            raise GitLabDRError(
+                "git bundle create failed for %s: %s" % (project_path, result.stderr.decode(errors="replace").strip())
+            )
+        with open(bundle_path, "rb") as fh:
+            data = fh.read()
+        _log("  bundled  %s (%.1f MB)" % (project_path, len(data) / 1024 / 1024))
+        return data
+
+
+def _push_bundle(bundle_bytes, push_url, git_env):
+    """Restore a git bundle by pushing all refs to a remote URL."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_path = os.path.join(tmpdir, "repo.bundle")
+        with open(bundle_path, "wb") as fh:
+            fh.write(bundle_bytes)
+        clone_dir = os.path.join(tmpdir, "clone")
+        result = _run_git(["clone", "--mirror", bundle_path, clone_dir], git_env)
+        if result.returncode != 0:
+            raise GitLabDRError("git clone from bundle failed: %s" % result.stderr.decode(errors="replace").strip())
+        result = _run_git(["push", "--mirror", push_url], git_env, cwd=clone_dir)
+        if result.returncode != 0:
+            raise GitLabDRError("git push failed: %s" % result.stderr.decode(errors="replace").strip())
+
+
+def _iter_repo_bundles(backup_data, base_url, token, cert=None, verify=True, report=None):
+    """Yield (archive_name, bundle_bytes) for every non-empty project repo in backup_data."""
+    git_env = _git_env(cert=cert, verify=verify)
+    stack = list(backup_data.get("groups", []))
+    while stack:
+        group_data = stack.pop(0)
+        for subgroup in group_data.get("subgroups", []):
+            stack.append(subgroup)
+        for project_data in group_data.get("projects", []):
+            details = project_data.get("details", {})
+            full_path = details.get("path_with_namespace") or details.get("path", "unknown")
+            clone_url = _git_clone_url(base_url, full_path, token)
+            try:
+                bundle_bytes = _bundle_project(full_path, clone_url, git_env)
+            except GitLabDRError as exc:
+                msg = "skipping repo %s: %s" % (full_path, exc)
+                if report is not None:
+                    report.warn(msg)
+                else:
+                    _log("warning: " + msg)
+                continue
+            if bundle_bytes:
+                yield "repos/%s.bundle" % full_path, bundle_bytes
+
+
+def _make_bundle_supplier(archive_path, password=None):
+    """Return a callable that reads a project's bundle from the archive by full path."""
+
+    def supplier(full_path):
+        archive_name = "repos/%s.bundle" % full_path
+        try:
+            if password:
+                with pyzipper.AESZipFile(archive_path, mode="r") as archive:
+                    archive.setpassword(password.encode("utf-8"))
+                    return archive.read(archive_name)
+            with zipfile.ZipFile(archive_path, mode="r") as archive:
+                return archive.read(archive_name)
+        except KeyError:
+            return None
+
+    return supplier
+
+
 def _collect_project_data(client, project):
     project_id = project["id"]
+    full_path = project.get("path_with_namespace") or project.get("path", str(project_id))
+    _log("  collecting project %s ..." % full_path)
     return {
         "details": client.project_details(project_id),
         "variables": client.project_variables(project_id),
@@ -190,22 +346,36 @@ def _collect_project_data(client, project):
     }
 
 
-def _collect_group_data(client, group, children_map):
+def _collect_group_data(client, group, children_map=None):
     group_id = group["id"]
+    full_path = group.get("full_path") or group.get("path", str(group_id))
+    _log("collecting group %s ..." % full_path)
     projects = client.group_projects(group_id)
+    if children_map is not None:
+        subgroups = children_map.get(group_id, [])
+    else:
+        subgroups = client.list_subgroups(group_id)
     return {
         "details": group,
         "variables": client.group_variables(group_id),
         "members": client.group_members(group_id),
         "projects": [_collect_project_data(client, project) for project in projects],
-        "subgroups": [
-            _collect_group_data(client, child, children_map)
-            for child in children_map.get(group_id, [])
-        ],
+        "subgroups": [_collect_group_data(client, child, children_map) for child in subgroups],
     }
 
 
-def build_backup(client):
+def build_backup(client, group_path=None):
+    _log("starting backup ...")
+    if group_path:
+        _log("fetching group %s ..." % group_path)
+        root = client.get_group(group_path)
+        if root is None:
+            raise GitLabDRError("Group not found: %s" % group_path)
+        return {
+            "schema_version": 1,
+            "groups": [_collect_group_data(client, root)],
+        }
+    _log("fetching all groups ...")
     groups = client.list_groups()
     children_map = {}
     top_level = []
@@ -223,10 +393,7 @@ def build_backup(client):
 
 def _restore_merge_requests(client, project_id, backup_merge_requests):
     existing = client.project_merge_requests(project_id, state="opened")
-    existing_keys = {
-        (mr.get("title"), mr.get("source_branch"), mr.get("target_branch"))
-        for mr in existing
-    }
+    existing_keys = {(mr.get("title"), mr.get("source_branch"), mr.get("target_branch")) for mr in existing}
     for mr in backup_merge_requests:
         key = (mr.get("title"), mr.get("source_branch"), mr.get("target_branch"))
         if not all(key) or key in existing_keys:
@@ -237,8 +404,10 @@ def _restore_merge_requests(client, project_id, backup_merge_requests):
             continue
 
 
-def _restore_project(client, namespace_id, namespace_path, project_data):
+def _restore_project(client, namespace_id, namespace_path, project_data, bundle_supplier=None, report=None):
     details = project_data["details"]
+    full_path = details.get("path_with_namespace") or "%s/%s" % (namespace_path, details["path"])
+    _log("  restoring project %s ..." % full_path)
     project = client.project_exists(namespace_path, details["path"])
     if project is None:
         project = client.create_project(
@@ -252,10 +421,32 @@ def _restore_project(client, namespace_id, namespace_path, project_data):
         if "key" in variable and "value" in variable:
             client.upsert_project_variable(project_id, variable)
     _restore_merge_requests(client, project_id, project_data.get("merge_requests", []))
+    if bundle_supplier:
+        full_path = (
+            details.get("path_with_namespace")
+            or project.get("path_with_namespace")
+            or "%s/%s" % (namespace_path, details["path"])
+        )
+        bundle_bytes = bundle_supplier(full_path)
+        if bundle_bytes:
+            push_url = _git_clone_url(client.base_url, project.get("path_with_namespace", full_path), client.token)
+            git_env = _git_env(cert=client.cert, verify=client.verify)
+            _log("  pushing repo  %s ..." % full_path)
+            try:
+                _push_bundle(bundle_bytes, push_url, git_env)
+                _log("  pushed        %s" % full_path)
+            except GitLabDRError as exc:
+                msg = "failed to push repo %s: %s" % (full_path, exc)
+                if report is not None:
+                    report.warn(msg)
+                else:
+                    _log("warning: " + msg)
 
 
-def _restore_group(client, group_data, parent=None):
+def _restore_group(client, group_data, parent=None, bundle_supplier=None, report=None):
     details = group_data["details"]
+    full_path = details.get("full_path") or details.get("path", "?")
+    _log("restoring group %s ..." % full_path)
     group = client.get_group(details["full_path"])
     if group is None:
         group = client.create_group(
@@ -272,18 +463,18 @@ def _restore_group(client, group_data, parent=None):
             client.upsert_group_variable(group_id, variable)
 
     for project in group_data.get("projects", []):
-        _restore_project(client, group_id, group_path, project)
+        _restore_project(client, group_id, group_path, project, bundle_supplier=bundle_supplier, report=report)
 
     for subgroup in group_data.get("subgroups", []):
-        _restore_group(client, subgroup, parent=group)
+        _restore_group(client, subgroup, parent=group, bundle_supplier=bundle_supplier, report=report)
 
 
-def restore_backup(client, backup_data):
+def restore_backup(client, backup_data, bundle_supplier=None, report=None):
     for group in backup_data.get("groups", []):
-        _restore_group(client, group)
+        _restore_group(client, group, bundle_supplier=bundle_supplier, report=report)
 
 
-def write_backup_archive(path, backup_data, encrypt=False, password=None):
+def write_backup_archive(path, backup_data, repo_bundles_iter=None, encrypt=False, password=None):
     payload = json.dumps(backup_data, indent=2, sort_keys=True).encode("utf-8")
     if encrypt:
         if not password:
@@ -297,10 +488,16 @@ def write_backup_archive(path, backup_data, encrypt=False, password=None):
             archive.setpassword(password.encode("utf-8"))
             archive.setencryption(pyzipper.WZ_AES, nbits=256)
             archive.writestr("backup.json", payload)
+            if repo_bundles_iter:
+                for name, data in repo_bundles_iter:
+                    archive.writestr(name, data)
         return
 
     with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("backup.json", payload)
+        if repo_bundles_iter:
+            for name, data in repo_bundles_iter:
+                archive.writestr(name, data)
 
 
 def archive_is_encrypted(path):

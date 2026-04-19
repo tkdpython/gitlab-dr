@@ -6,3 +6,4 @@
 - Add richer restore support for additional settings (branch protections, webhooks, approvals, runners).
 - Add integration tests against a disposable GitLab test instance.
 - Add signed release process and provenance attestation checks for publishing.
+- Add LFS support for `--include-repos` (`git lfs fetch --all` before bundling).

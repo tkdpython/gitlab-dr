@@ -6,6 +6,10 @@ import sys
 from .core import (
     GitLabClient,
     GitLabDRError,
+    RunReport,
+    _iter_repo_bundles,
+    _log,
+    _make_bundle_supplier,
     archive_is_encrypted,
     build_backup,
     read_backup_archive,
@@ -23,12 +27,21 @@ def build_parser():
     mode.add_argument("--backup", action="store_true", help="Create a backup archive.")
     mode.add_argument("--restore", action="store_true", help="Restore from backup archive.")
 
-    parser.add_argument("--source", required=True, help="Source URL (backup) or archive path (restore).")
-    parser.add_argument(
-        "--destination", required=True, help="Destination archive path (backup) or URL (restore)."
-    )
+    parser.add_argument("--gitlab-url", required=True, help="GitLab instance URL.")
+    parser.add_argument("--backup-file", required=True, help="Path to the backup archive file.")
     parser.add_argument("--token", default=os.getenv("GITLAB_DR_TOKEN"), help="GitLab admin PAT token.")
     parser.add_argument("--encrypt", action="store_true", help="Encrypt backup archive with AES-256.")
+    parser.add_argument(
+        "--include-repos",
+        action="store_true",
+        default=False,
+        help="Include git repository contents as bundles in the archive (requires git on PATH).",
+    )
+    parser.add_argument(
+        "--group",
+        default=None,
+        help="Scope backup/restore to a specific group by full path (e.g. 'mygroup' or 'mygroup/subgroup').",
+    )
     parser.add_argument(
         "--client-cert",
         default=os.getenv("GITLAB_DR_CLIENT_CERT"),
@@ -76,24 +89,53 @@ def _build_client(url, args):
 
 
 def run_backup(args):
+    report = RunReport()
     password = resolve_password(args.encrypt, "backup")
-    client = _build_client(args.source, args)
-    backup_data = build_backup(client)
-    write_backup_archive(args.destination, backup_data, encrypt=args.encrypt, password=password)
+    client = _build_client(args.gitlab_url, args)
+    backup_data = build_backup(client, group_path=args.group)
+    repo_bundles_iter = None
+    if args.include_repos:
+        _log("bundling repositories ...")
+        repo_bundles_iter = _iter_repo_bundles(
+            backup_data,
+            base_url=client.base_url,
+            token=client.token,
+            cert=client.cert,
+            verify=client.verify,
+            report=report,
+        )
+    _log("writing archive %s ..." % args.backup_file)
+    write_backup_archive(
+        args.backup_file,
+        backup_data,
+        repo_bundles_iter=repo_bundles_iter,
+        encrypt=args.encrypt,
+        password=password,
+    )
+    _log("backup complete: %s" % args.backup_file)
+    report.print_summary()
     return 0
 
 
 def run_restore(args):
+    report = RunReport()
     encrypted = args.encrypt
     if not encrypted:
         try:
-            encrypted = archive_is_encrypted(args.source)
+            encrypted = archive_is_encrypted(args.backup_file)
         except Exception:
             encrypted = False
     password = resolve_password(encrypted, "restore")
-    backup_data = read_backup_archive(args.source, password=password)
-    client = _build_client(args.destination, args)
-    restore_backup(client, backup_data)
+    _log("reading archive %s ..." % args.backup_file)
+    backup_data = read_backup_archive(args.backup_file, password=password)
+    client = _build_client(args.gitlab_url, args)
+    bundle_supplier = None
+    if args.include_repos:
+        bundle_supplier = _make_bundle_supplier(args.backup_file, password=password if encrypted else None)
+    _log("starting restore ...")
+    restore_backup(client, backup_data, bundle_supplier=bundle_supplier, report=report)
+    _log("restore complete")
+    report.print_summary()
     return 0
 
 

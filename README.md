@@ -7,6 +7,7 @@
 - Python `>=3.6`
 - GitLab admin Personal Access Token (PAT)
 - Network access to the source/destination GitLab instances
+- `git` on `PATH` (required only when `--include-repos` is used)
 
 ## Install
 
@@ -36,9 +37,35 @@ python -m gitlab_dr --help
 ```bash
 gitlab_dr \
   --backup \
-  --source https://gitlab.source.example \
-  --destination /path/to/backup.zip \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
   --token "$GITLAB_DR_TOKEN"
+```
+
+Scope to a specific group or nested subgroup:
+
+```bash
+gitlab_dr \
+  --backup \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
+  --group my-group
+
+gitlab_dr \
+  --backup \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
+  --group my-group/sub-group
+```
+
+Include full git repository contents (`git clone --mirror` + bundle):
+
+```bash
+gitlab_dr \
+  --backup \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
+  --include-repos
 ```
 
 Encrypted backup (AES-256):
@@ -46,8 +73,8 @@ Encrypted backup (AES-256):
 ```bash
 gitlab_dr \
   --backup \
-  --source https://gitlab.source.example \
-  --destination /path/to/backup.zip \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
   --encrypt
 ```
 
@@ -58,9 +85,19 @@ When `--encrypt` is set, the CLI prompts for a password unless `GITLAB_DR_PASSWO
 ```bash
 gitlab_dr \
   --restore \
-  --source /path/to/backup.zip \
-  --destination https://gitlab.target.example \
+  --gitlab-url https://gitlab.target.example.com \
+  --backup-file /path/to/backup.zip \
   --token "$GITLAB_DR_TOKEN"
+```
+
+Restore including git repository contents:
+
+```bash
+gitlab_dr \
+  --restore \
+  --gitlab-url https://gitlab.target.example.com \
+  --backup-file /path/to/backup.zip \
+  --include-repos
 ```
 
 ### mTLS support
@@ -68,10 +105,22 @@ gitlab_dr \
 ```bash
 gitlab_dr \
   --backup \
-  --source https://gitlab.source.example \
-  --destination /path/to/backup.zip \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
   --client-cert /path/to/client.crt.pem \
   --client-key /path/to/client.key.pem
+```
+
+When `--include-repos` is used alongside mTLS, the client certificate and key are passed to `git` via `GIT_SSL_CERT` and `GIT_SSL_KEY` environment variables automatically.
+
+To trust a custom CA:
+
+```bash
+gitlab_dr \
+  --backup \
+  --gitlab-url https://gitlab.example.com \
+  --backup-file /path/to/backup.zip \
+  --ca-cert /path/to/ca-bundle.pem
 ```
 
 ## Backup scope
@@ -82,5 +131,8 @@ The backup captures recursively discovered groups/subgroups and contained projec
 - Group and project CI/CD variables
 - Project merge requests
 - Group member listings
+- Git repository contents (all branches, tags, and refs) — when `--include-repos` is used
 
-Restore recreates missing groups/projects and reapplies variables and merge requests where possible.
+Restore recreates missing groups/projects and reapplies variables and merge requests where possible. When `--include-repos` is used on restore, each project's git history is pushed to the target instance via `git push --mirror`. Failures on individual repositories are reported as warnings and do not abort the rest of the restore.
+
+Empty repositories (no commits) are silently skipped during bundle creation.
