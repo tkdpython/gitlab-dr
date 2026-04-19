@@ -6,6 +6,7 @@ import sys
 from .core import (
     GitLabClient,
     GitLabDRError,
+    archive_is_encrypted,
     build_backup,
     read_backup_archive,
     restore_backup,
@@ -86,8 +87,6 @@ def run_restore(args):
     encrypted = args.encrypt
     if not encrypted:
         try:
-            from .core import archive_is_encrypted
-
             encrypted = archive_is_encrypted(args.source)
         except Exception:
             encrypted = False

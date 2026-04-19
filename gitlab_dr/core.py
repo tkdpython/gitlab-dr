@@ -107,10 +107,10 @@ class GitLabClient(object):
     def project_variables(self, project_id):
         return self.list_paginated("/projects/%s/variables" % project_id)
 
-    def project_merge_requests(self, project_id):
+    def project_merge_requests(self, project_id, state="all"):
         return self.list_paginated(
             "/projects/%s/merge_requests" % project_id,
-            params={"state": "all"},
+            params={"state": state},
         )
 
     def project_exists(self, namespace_path, path):
@@ -126,12 +126,6 @@ class GitLabClient(object):
         if visibility:
             payload["visibility"] = visibility
         return self._request("POST", "/projects", payload=payload, expected=(201,))
-
-    def list_project_merge_requests(self, project_id):
-        return self.list_paginated(
-            "/projects/%s/merge_requests" % project_id,
-            params={"state": "opened"},
-        )
 
     def create_merge_request(self, project_id, title, source_branch, target_branch):
         payload = {
@@ -228,7 +222,7 @@ def build_backup(client):
 
 
 def _restore_merge_requests(client, project_id, backup_merge_requests):
-    existing = client.list_project_merge_requests(project_id)
+    existing = client.project_merge_requests(project_id, state="opened")
     existing_keys = {
         (mr.get("title"), mr.get("source_branch"), mr.get("target_branch"))
         for mr in existing
