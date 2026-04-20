@@ -88,8 +88,11 @@ def _build_client(url, args):
         raise GitLabDRError("GitLab token is required (--token or GITLAB_DR_TOKEN)")
     if bool(args.client_cert) != bool(args.client_key):
         raise GitLabDRError("Both --client-cert and --client-key must be provided together")
-    cert = (args.client_cert, args.client_key) if args.client_cert and args.client_key else None
-    verify = args.ca_cert if args.ca_cert else True
+    client_cert = os.path.expanduser(args.client_cert) if args.client_cert else None
+    client_key = os.path.expanduser(args.client_key) if args.client_key else None
+    ca_cert = os.path.expanduser(args.ca_cert) if args.ca_cert else None
+    cert = (client_cert, client_key) if client_cert and client_key else None
+    verify = ca_cert if ca_cert else True
     return GitLabClient(url, token=args.token, cert=cert, verify=verify)
 
 
