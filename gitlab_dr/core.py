@@ -253,14 +253,14 @@ def _git_env(cert=None, verify=True, token=None):
     elif not verify:
         env["GIT_SSL_NO_VERIFY"] = "1"
     if token:
-        # Use PRIVATE-TOKEN header rather than embedding credentials in the URL.
-        # oauth2: URL credentials fail on GitLab instances that validate tokens as
-        # JWTs (e.g. those using Keycloak OIDC), whereas PRIVATE-TOKEN is accepted
-        # directly by GitLab for PATs without going through the OIDC code path.
+        # Use Authorization: Bearer rather than embedding credentials in the URL.
+        # oauth2:<token>@ URL credentials fail on GitLab instances that validate
+        # tokens as JWTs (e.g. Keycloak OIDC). Bearer token auth is accepted by
+        # GitLab's git HTTP transport for PATs without going through OIDC.
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         env["GIT_CONFIG_COUNT"] = str(count + 1)
         env["GIT_CONFIG_KEY_%d" % count] = "http.extraHeader"
-        env["GIT_CONFIG_VALUE_%d" % count] = "PRIVATE-TOKEN: %s" % token
+        env["GIT_CONFIG_VALUE_%d" % count] = "Authorization: Bearer %s" % token
     return env
 
 
