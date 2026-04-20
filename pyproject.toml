@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=42", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitlab-dr"
+dynamic = ["version"]
+description = "GitLab disaster recovery backup/restore CLI"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {text = "MIT"}
+authors = [{ name = "gitlab-dr contributors" }]
+dependencies = [
+  "requests>=2.27.1,<3",
+  "pyzipper>=0.3.6,<1",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.6",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+]
+
+[tool.setuptools_scm]
+# Derives version from git tags (e.g. v0.3.0 → 0.3.0).
+# Commits after a tag produce a dev suffix: 0.3.0.dev3+gabcdef
+version_scheme = "post-release"
+local_scheme = "no-local-version"
+
+[project.scripts]
+gitlab_dr = "gitlab_dr.cli:main"
+
+[tool.setuptools.packages.find]
+exclude = ["tests*"]
