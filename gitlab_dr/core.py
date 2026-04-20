@@ -242,7 +242,7 @@ class GitLabClient(object):
             )
 
 
-def _git_env(cert=None, verify=True):
+def _git_env(cert=None, verify=True, token=None):
     """Return a subprocess environment dict with git SSL settings applied."""
     env = os.environ.copy()
     if cert:
@@ -252,13 +252,22 @@ def _git_env(cert=None, verify=True):
         env["GIT_SSL_CAINFO"] = verify
     elif not verify:
         env["GIT_SSL_NO_VERIFY"] = "1"
+    if token:
+        # Use PRIVATE-TOKEN header rather than embedding credentials in the URL.
+        # oauth2: URL credentials fail on GitLab instances that validate tokens as
+        # JWTs (e.g. those using Keycloak OIDC), whereas PRIVATE-TOKEN is accepted
+        # directly by GitLab for PATs without going through the OIDC code path.
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        env["GIT_CONFIG_COUNT"] = str(count + 1)
+        env["GIT_CONFIG_KEY_%d" % count] = "http.extraHeader"
+        env["GIT_CONFIG_VALUE_%d" % count] = "PRIVATE-TOKEN: %s" % token
     return env
 
 
 def _git_clone_url(base_url, project_path_with_namespace, token):
-    """Build an authenticated HTTPS git clone URL."""
+    """Build a credential-free HTTPS git clone URL (auth is injected via http.extraHeader)."""
     parsed = urlparse(base_url)
-    netloc = "oauth2:%s@%s" % (token, parsed.hostname)
+    netloc = parsed.hostname
     if parsed.port:
         netloc += ":%d" % parsed.port
     path = "/%s.git" % project_path_with_namespace.lstrip("/")
@@ -320,7 +329,7 @@ def _push_bundle(bundle_bytes, push_url, git_env):
 
 def _iter_repo_bundles(backup_data, base_url, token, cert=None, verify=True, report=None):
     """Yield (archive_name, bundle_bytes) for every non-empty project repo in backup_data."""
-    git_env = _git_env(cert=cert, verify=verify)
+    git_env = _git_env(cert=cert, verify=verify, token=token)
     stack = list(backup_data.get("groups", []))
     while stack:
         group_data = stack.pop(0)
@@ -495,7 +504,7 @@ def _restore_project(client, namespace_id, namespace_path, project_data, bundle_
         bundle_bytes = bundle_supplier(full_path)
         if bundle_bytes:
             push_url = _git_clone_url(client.base_url, project.get("path_with_namespace", full_path), client.token)
-            git_env = _git_env(cert=client.cert, verify=client.verify)
+            git_env = _git_env(cert=client.cert, verify=client.verify, token=client.token)
             _log("  pushing repo  %s ..." % full_path)
             try:
                 _push_bundle(bundle_bytes, push_url, git_env)
@@ -578,7 +587,7 @@ def _write_repo_files_to_dir(backup_data, base_url, token, dest_dir, cert=None, 
     directory fully readable and transformable by text-processing tools such as
     xsyncfar.  Git history is NOT preserved — see --repos-as-files for details.
     """
-    git_env = _git_env(cert=cert, verify=verify)
+    git_env = _git_env(cert=cert, verify=verify, token=token)
     stack = list(backup_data.get("groups", []))
     while stack:
         group_data = stack.pop(0)
