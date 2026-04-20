@@ -27,7 +27,12 @@ def build_parser():
     mode.add_argument("--backup", action="store_true", help="Create a backup archive.")
     mode.add_argument("--restore", action="store_true", help="Restore from backup archive.")
 
-    parser.add_argument("--gitlab-url", required=True, help="GitLab instance URL.")
+    parser.add_argument(
+        "--gitlab-url",
+        default=os.getenv("GITLAB_DR_URL"),
+        required=not os.getenv("GITLAB_DR_URL"),
+        help="GitLab instance URL (or set GITLAB_DR_URL).",
+    )
     parser.add_argument("--backup-file", required=True, help="Path to the backup archive file.")
     parser.add_argument("--token", default=os.getenv("GITLAB_DR_TOKEN"), help="GitLab admin PAT token.")
     parser.add_argument("--encrypt", action="store_true", help="Encrypt backup archive with AES-256.")
