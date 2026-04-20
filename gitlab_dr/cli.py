@@ -92,7 +92,7 @@ def run_backup(args):
     report = RunReport()
     password = resolve_password(args.encrypt, "backup")
     client = _build_client(args.gitlab_url, args)
-    backup_data = build_backup(client, group_path=args.group)
+    backup_data = build_backup(client, group_path=args.group, report=report)
     repo_bundles_iter = None
     if args.include_repos:
         _log("bundling repositories ...")
@@ -114,6 +114,9 @@ def run_backup(args):
     )
     _log("backup complete: %s" % args.backup_file)
     report.print_summary()
+    log_path = os.path.splitext(args.backup_file)[0] + ".log"
+    report.write_log(log_path)
+    _log("log written: %s" % log_path)
     return 0
 
 

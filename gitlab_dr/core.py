@@ -21,19 +21,40 @@ def _log(msg):
 class RunReport:
     def __init__(self):
         self.warnings = []
+        self._lines = []
+
+    def info(self, msg):
+        _log(msg)
+        self._lines.append(msg)
 
     def warn(self, msg):
-        _log("warning: " + msg)
+        full = "warning: " + msg
+        _log(full)
+        self._lines.append(full)
         self.warnings.append(msg)
 
     def print_summary(self):
         _log("")
+        self._lines.append("")
         if not self.warnings:
             _log("summary: completed with no warnings")
+            self._lines.append("summary: completed with no warnings")
             return
-        _log("summary: %d warning(s):" % len(self.warnings))
+        summary = "summary: %d warning(s):" % len(self.warnings)
+        _log(summary)
+        self._lines.append(summary)
         for w in self.warnings:
-            _log("  - " + w)
+            line = "  - " + w
+            _log(line)
+            self._lines.append(line)
+
+    def write_log(self, path):
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(self._lines))
+                fh.write("\n")
+        except OSError as exc:
+            _log("warning: could not write log file %s: %s" % (path, exc))
 
 
 class GitLabClient(object):
@@ -339,8 +360,10 @@ def _make_bundle_supplier(archive_path, password=None):
     return supplier
 
 
-def _fetch_variables_with_sudo(client, project_id, full_path, details):
+def _fetch_variables_with_sudo(client, project_id, full_path, details, report=None):
     """Try to fetch project variables by sudoing as creator, then as first owner/maintainer."""
+    log = report.info if report else _log
+    warn = report.warn if report else lambda m: _log("warning: " + m)
     # Access levels: 50=owner, 40=maintainer
     candidates = []
     creator_id = details.get("creator_id")
@@ -354,25 +377,28 @@ def _fetch_variables_with_sudo(client, project_id, full_path, details):
     except GitLabDRError:
         pass
     for label, uid in candidates:
-        _log("  403 on variables for %s, retrying with sudo=%s (%s) ..." % (full_path, uid, label))
+        log("  403 on variables for %s, retrying with sudo=%s (%s) ..." % (full_path, uid, label))
         try:
             return client.project_variables(project_id, sudo=uid)
         except GitLabDRError:
             continue
-    _log("warning: cannot fetch variables for %s (exhausted sudo candidates)" % full_path)
+    archived = details.get("archived", False)
+    reason = " (project is archived)" if archived else " (exhausted sudo candidates)"
+    warn("cannot fetch variables for %s%s" % (full_path, reason))
     return []
 
 
-def _collect_project_data(client, project):
+def _collect_project_data(client, project, report=None):
+    log = report.info if report else _log
     project_id = project["id"]
     full_path = project.get("path_with_namespace") or project.get("path", str(project_id))
-    _log("  collecting project %s ..." % full_path)
+    log("  collecting project %s ..." % full_path)
     details = client.project_details(project_id)
     try:
         variables = client.project_variables(project_id)
     except GitLabDRError as exc:
         if "403" in str(exc):
-            variables = _fetch_variables_with_sudo(client, project_id, full_path, details)
+            variables = _fetch_variables_with_sudo(client, project_id, full_path, details, report=report)
         else:
             raise
     return {
@@ -382,10 +408,11 @@ def _collect_project_data(client, project):
     }
 
 
-def _collect_group_data(client, group, children_map=None):
+def _collect_group_data(client, group, children_map=None, report=None):
+    log = report.info if report else _log
     group_id = group["id"]
     full_path = group.get("full_path") or group.get("path", str(group_id))
-    _log("collecting group %s ..." % full_path)
+    log("collecting group %s ..." % full_path)
     projects = client.group_projects(group_id)
     if children_map is not None:
         subgroups = children_map.get(group_id, [])
@@ -395,23 +422,24 @@ def _collect_group_data(client, group, children_map=None):
         "details": group,
         "variables": client.group_variables(group_id),
         "members": client.group_members(group_id),
-        "projects": [_collect_project_data(client, project) for project in projects],
-        "subgroups": [_collect_group_data(client, child, children_map) for child in subgroups],
+        "projects": [_collect_project_data(client, project, report=report) for project in projects],
+        "subgroups": [_collect_group_data(client, child, children_map, report=report) for child in subgroups],
     }
 
 
-def build_backup(client, group_path=None):
-    _log("starting backup ...")
+def build_backup(client, group_path=None, report=None):
+    log = report.info if report else _log
+    log("starting backup ...")
     if group_path:
-        _log("fetching group %s ..." % group_path)
+        log("fetching group %s ..." % group_path)
         root = client.get_group(group_path)
         if root is None:
             raise GitLabDRError("Group not found: %s" % group_path)
         return {
             "schema_version": 1,
-            "groups": [_collect_group_data(client, root)],
+            "groups": [_collect_group_data(client, root, report=report)],
         }
-    _log("fetching all groups ...")
+    log("fetching all groups ...")
     groups = client.list_groups()
     children_map = {}
     top_level = []
@@ -423,7 +451,7 @@ def build_backup(client, group_path=None):
         children_map.setdefault(parent_id, []).append(group)
     return {
         "schema_version": 1,
-        "groups": [_collect_group_data(client, group, children_map) for group in top_level],
+        "groups": [_collect_group_data(client, group, children_map, report=report) for group in top_level],
     }
 
 
