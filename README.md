@@ -24,11 +24,18 @@ python -m gitlab_dr --help
 
 ## Authentication and environment variables
 
-- `GITLAB_DR_TOKEN`: GitLab admin PAT (used if `--token` is not provided)
-- `GITLAB_DR_PASSWORD`: password used for encrypted backup/restore archives
-- `GITLAB_DR_CLIENT_CERT`: PEM client certificate path for mTLS
-- `GITLAB_DR_CLIENT_KEY`: PEM client key path for mTLS
-- `GITLAB_DR_CA_CERT`: optional CA bundle path
+All options can be supplied via environment variables instead of CLI flags. Tilde (`~`) expansion is supported in all path values.
+
+| Variable | CLI flag | Description |
+|---|---|---|
+| `GITLAB_DR_URL` | `--gitlab-url` | GitLab instance URL |
+| `GITLAB_DR_TOKEN` | `--token` | GitLab admin PAT |
+| `GITLAB_DR_PASSWORD` | *(prompted)* | Password for encrypted archives |
+| `GITLAB_DR_CLIENT_CERT` | `--client-cert` | PEM client certificate path (mTLS) |
+| `GITLAB_DR_CLIENT_KEY` | `--client-key` | PEM client key path (mTLS) |
+| `GITLAB_DR_CA_CERT` | `--ca-cert` | Custom CA bundle path |
+
+`GITLAB_DR_URL` and `GITLAB_DR_TOKEN` are required (either as env vars or CLI flags). `GITLAB_DR_PASSWORD` is read automatically when `--encrypt` is set, falling back to an interactive prompt if not set.
 
 ## Usage
 
@@ -128,10 +135,22 @@ gitlab_dr \
 The backup captures recursively discovered groups/subgroups and contained projects, including:
 
 - Group and project metadata
-- Group and project CI/CD variables
+- Group and project CI/CD variables (including masked values — store the archive securely)
 - Project merge requests
 - Group member listings
 - Git repository contents (all branches, tags, and refs) — when `--include-repos` is used
+
+### CI/CD variable access
+
+An admin PAT returns unmasked CI/CD variable values. If a project returns 403 for variables (common on archived projects or projects where the creator account has been removed), the tool automatically retries using `Sudo` impersonation — first as the project `creator_id`, then as each current owner/maintainer. If all candidates are exhausted the project is skipped with a warning rather than aborting the run.
+
+> ⚠️ The backup archive will contain plaintext secrets. Use `--encrypt` and protect the output file appropriately.
+
+### Run log
+
+After every backup a `.log` file is written alongside the archive (e.g. `backup.zip` → `backup.log`) containing the full run transcript including all warnings. The terminal summary lists only warnings; the log file contains everything.
+
+### Restore behaviour
 
 Restore recreates missing groups/projects and reapplies variables and merge requests where possible. When `--include-repos` is used on restore, each project's git history is pushed to the target instance via `git push --mirror`. Failures on individual repositories are reported as warnings and do not abort the rest of the restore.
 
