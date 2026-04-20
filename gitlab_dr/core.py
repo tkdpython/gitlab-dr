@@ -143,6 +143,9 @@ class GitLabClient(object):
     def project_variables(self, project_id, sudo=None):
         return self.list_paginated("/projects/%s/variables" % project_id, sudo=sudo)
 
+    def project_members(self, project_id):
+        return self.list_paginated("/projects/%s/members/all" % project_id)
+
     def project_merge_requests(self, project_id, state="all"):
         return self.list_paginated(
             "/projects/%s/merge_requests" % project_id,
@@ -336,6 +339,30 @@ def _make_bundle_supplier(archive_path, password=None):
     return supplier
 
 
+def _fetch_variables_with_sudo(client, project_id, full_path, details):
+    """Try to fetch project variables by sudoing as creator, then as first owner/maintainer."""
+    # Access levels: 50=owner, 40=maintainer
+    candidates = []
+    creator_id = details.get("creator_id")
+    if creator_id:
+        candidates.append(("creator", creator_id))
+    try:
+        members = client.project_members(project_id)
+        for member in members:
+            if member.get("access_level", 0) >= 40:
+                candidates.append(("member", member["id"]))
+    except GitLabDRError:
+        pass
+    for label, uid in candidates:
+        _log("  403 on variables for %s, retrying with sudo=%s (%s) ..." % (full_path, uid, label))
+        try:
+            return client.project_variables(project_id, sudo=uid)
+        except GitLabDRError:
+            continue
+    _log("warning: cannot fetch variables for %s (exhausted sudo candidates)" % full_path)
+    return []
+
+
 def _collect_project_data(client, project):
     project_id = project["id"]
     full_path = project.get("path_with_namespace") or project.get("path", str(project_id))
@@ -345,17 +372,7 @@ def _collect_project_data(client, project):
         variables = client.project_variables(project_id)
     except GitLabDRError as exc:
         if "403" in str(exc):
-            creator_id = details.get("creator_id")
-            if creator_id:
-                _log("  403 on variables for %s, retrying with sudo=%s ..." % (full_path, creator_id))
-                try:
-                    variables = client.project_variables(project_id, sudo=creator_id)
-                except GitLabDRError as exc2:
-                    _log("warning: cannot fetch variables for %s even with sudo: %s" % (full_path, exc2))
-                    variables = []
-            else:
-                _log("warning: cannot fetch variables for %s (no creator_id for sudo): %s" % (full_path, exc))
-                variables = []
+            variables = _fetch_variables_with_sudo(client, project_id, full_path, details)
         else:
             raise
     return {
