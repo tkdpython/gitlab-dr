@@ -71,14 +71,15 @@ class GitLabClient(object):
             return response.json()
         return response.text
 
-    def list_paginated(self, path, params=None):
+    def list_paginated(self, path, params=None, sudo=None):
         page = 1
         all_items = []
         params = dict(params or {})
         params.setdefault("per_page", 100)
+        headers = {"Sudo": str(sudo)} if sudo is not None else {}
         while True:
             params["page"] = page
-            response = self.session.get(self._url(path), params=params, timeout=self.timeout)
+            response = self.session.get(self._url(path), params=params, headers=headers, timeout=self.timeout)
             if response.status_code != 200:
                 raise GitLabDRError("GitLab API GET %s failed: %s %s" % (path, response.status_code, response.text))
             if not response.text:
@@ -139,8 +140,8 @@ class GitLabClient(object):
     def project_details(self, project_id):
         return self._request("GET", "/projects/%s" % project_id)
 
-    def project_variables(self, project_id):
-        return self.list_paginated("/projects/%s/variables" % project_id)
+    def project_variables(self, project_id, sudo=None):
+        return self.list_paginated("/projects/%s/variables" % project_id, sudo=sudo)
 
     def project_merge_requests(self, project_id, state="all"):
         return self.list_paginated(
@@ -339,9 +340,27 @@ def _collect_project_data(client, project):
     project_id = project["id"]
     full_path = project.get("path_with_namespace") or project.get("path", str(project_id))
     _log("  collecting project %s ..." % full_path)
+    details = client.project_details(project_id)
+    try:
+        variables = client.project_variables(project_id)
+    except GitLabDRError as exc:
+        if "403" in str(exc):
+            creator_id = details.get("creator_id")
+            if creator_id:
+                _log("  403 on variables for %s, retrying with sudo=%s ..." % (full_path, creator_id))
+                try:
+                    variables = client.project_variables(project_id, sudo=creator_id)
+                except GitLabDRError as exc2:
+                    _log("warning: cannot fetch variables for %s even with sudo: %s" % (full_path, exc2))
+                    variables = []
+            else:
+                _log("warning: cannot fetch variables for %s (no creator_id for sudo): %s" % (full_path, exc))
+                variables = []
+        else:
+            raise
     return {
-        "details": client.project_details(project_id),
-        "variables": client.project_variables(project_id),
+        "details": details,
+        "variables": variables,
         "merge_requests": client.project_merge_requests(project_id),
     }
 
