@@ -7,14 +7,20 @@ from .core import (
     GitLabClient,
     GitLabDRError,
     RunReport,
+    _git_env,
     _iter_repo_bundles,
     _log,
     _make_bundle_supplier,
+    _make_bundle_supplier_dir,
+    _make_files_supplier_dir,
+    _write_repo_files_to_dir,
     archive_is_encrypted,
     build_backup,
     read_backup_archive,
+    read_backup_dir,
     restore_backup,
     write_backup_archive,
+    write_backup_dir,
 )
 
 
@@ -33,14 +39,34 @@ def build_parser():
         required=not os.getenv("GITLAB_DR_URL"),
         help="GitLab instance URL (or set GITLAB_DR_URL).",
     )
-    parser.add_argument("--backup-file", required=True, help="Path to the backup archive file.")
+    backup_target = parser.add_mutually_exclusive_group(required=True)
+    backup_target.add_argument("--backup-file", help="Path to the backup archive (.zip) file.")
+    backup_target.add_argument(
+        "--backup-dir",
+        help="Path to a directory for uncompressed backup. Encryption is not available in this mode.",
+    )
     parser.add_argument("--token", default=os.getenv("GITLAB_DR_TOKEN"), help="GitLab admin PAT token.")
-    parser.add_argument("--encrypt", action="store_true", help="Encrypt backup archive with AES-256.")
     parser.add_argument(
-        "--include-repos",
+        "--encrypt",
+        action="store_true",
+        help="Encrypt backup archive with AES-256 (--backup-file only).",
+    )
+    parser.add_argument(
+        "--exclude-repo-clone",
         action="store_true",
         default=False,
-        help="Include git repository contents as bundles in the archive (requires git on PATH).",
+        help="Exclude git repository contents from the backup/restore. By default, repos are included.",
+    )
+    parser.add_argument(
+        "--repos-as-files",
+        action="store_true",
+        default=False,
+        help=(
+            "Store repository contents as plain files instead of git bundles (--backup-dir only). "
+            "WARNING: git history is NOT preserved. On restore, each project is created with a "
+            "single initial commit. Use this mode when you need to post-process the files with "
+            "text transformation tools (e.g. xsyncfar) before restoring to a different environment."
+        ),
     )
     parser.add_argument(
         "--group",
@@ -98,11 +124,35 @@ def _build_client(url, args):
 
 def run_backup(args):
     report = RunReport()
-    password = resolve_password(args.encrypt, "backup")
     client = _build_client(args.gitlab_url, args)
     backup_data = build_backup(client, group_path=args.group, report=report)
     repo_bundles_iter = None
-    if args.include_repos:
+    if args.backup_dir and args.repos_as_files:
+        warning = (
+            "WARNING: --repos-as-files is set. Repository contents will be stored as plain "
+            "files. Git history will NOT be preserved. On restore, each project will be "
+            "created with a single initial commit."
+        )
+        _log(warning)
+        report.warn(warning)
+        _log("checking out repository files ...")
+        write_backup_dir(args.backup_dir, backup_data)
+        _write_repo_files_to_dir(
+            backup_data,
+            base_url=client.base_url,
+            token=client.token,
+            dest_dir=args.backup_dir,
+            cert=client.cert,
+            verify=client.verify,
+            report=report,
+        )
+        _log("backup complete: %s" % args.backup_dir)
+        report.print_summary()
+        log_path = os.path.join(args.backup_dir, "backup.log")
+        report.write_log(log_path)
+        _log("log written: %s" % log_path)
+        return 0
+    if not args.exclude_repo_clone:
         _log("bundling repositories ...")
         repo_bundles_iter = _iter_repo_bundles(
             backup_data,
@@ -112,37 +162,64 @@ def run_backup(args):
             verify=client.verify,
             report=report,
         )
-    _log("writing archive %s ..." % args.backup_file)
-    write_backup_archive(
-        args.backup_file,
-        backup_data,
-        repo_bundles_iter=repo_bundles_iter,
-        encrypt=args.encrypt,
-        password=password,
-    )
-    _log("backup complete: %s" % args.backup_file)
-    report.print_summary()
-    log_path = os.path.splitext(args.backup_file)[0] + ".log"
-    report.write_log(log_path)
-    _log("log written: %s" % log_path)
+    if args.backup_dir:
+        _log("writing backup to directory %s ..." % args.backup_dir)
+        write_backup_dir(args.backup_dir, backup_data, repo_bundles_iter=repo_bundles_iter)
+        _log("backup complete: %s" % args.backup_dir)
+        report.print_summary()
+        log_path = os.path.join(args.backup_dir, "backup.log")
+        report.write_log(log_path)
+        _log("log written: %s" % log_path)
+    else:
+        password = resolve_password(args.encrypt, "backup")
+        _log("writing archive %s ..." % args.backup_file)
+        write_backup_archive(
+            args.backup_file,
+            backup_data,
+            repo_bundles_iter=repo_bundles_iter,
+            encrypt=args.encrypt,
+            password=password,
+        )
+        _log("backup complete: %s" % args.backup_file)
+        report.print_summary()
+        log_path = os.path.splitext(args.backup_file)[0] + ".log"
+        report.write_log(log_path)
+        _log("log written: %s" % log_path)
     return 0
 
 
 def run_restore(args):
     report = RunReport()
-    encrypted = args.encrypt
-    if not encrypted:
-        try:
-            encrypted = archive_is_encrypted(args.backup_file)
-        except Exception:
-            encrypted = False
-    password = resolve_password(encrypted, "restore")
-    _log("reading archive %s ..." % args.backup_file)
-    backup_data = read_backup_archive(args.backup_file, password=password)
     client = _build_client(args.gitlab_url, args)
     bundle_supplier = None
-    if args.include_repos:
-        bundle_supplier = _make_bundle_supplier(args.backup_file, password=password if encrypted else None)
+    if args.backup_dir:
+        _log("reading backup from directory %s ..." % args.backup_dir)
+        backup_data = read_backup_dir(args.backup_dir)
+        if not args.exclude_repo_clone:
+            if args.repos_as_files:
+                warning = (
+                    "WARNING: --repos-as-files is set. Repositories will be restored from plain "
+                    "files as a single initial commit. Git history from the original source will "
+                    "NOT be present in the restored projects."
+                )
+                _log(warning)
+                report.warn(warning)
+                git_env = _git_env(cert=client.cert, verify=client.verify)
+                bundle_supplier = _make_files_supplier_dir(args.backup_dir, git_env)
+            else:
+                bundle_supplier = _make_bundle_supplier_dir(args.backup_dir)
+    else:
+        encrypted = args.encrypt
+        if not encrypted:
+            try:
+                encrypted = archive_is_encrypted(args.backup_file)
+            except Exception:
+                encrypted = False
+        password = resolve_password(encrypted, "restore")
+        _log("reading archive %s ..." % args.backup_file)
+        backup_data = read_backup_archive(args.backup_file, password=password)
+        if not args.exclude_repo_clone:
+            bundle_supplier = _make_bundle_supplier(args.backup_file, password=password if encrypted else None)
     _log("starting restore ...")
     restore_backup(client, backup_data, bundle_supplier=bundle_supplier, report=report)
     _log("restore complete")
@@ -154,6 +231,15 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.backup_dir and args.encrypt:
+            print("error: --encrypt is not supported with --backup-dir", file=sys.stderr)
+            return 1
+        if args.repos_as_files and not args.backup_dir:
+            print("error: --repos-as-files requires --backup-dir", file=sys.stderr)
+            return 1
+        if args.repos_as_files and args.exclude_repo_clone:
+            print("error: --repos-as-files and --exclude-repo-clone are mutually exclusive", file=sys.stderr)
+            return 1
         if args.backup:
             return run_backup(args)
         return run_restore(args)

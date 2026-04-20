@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -536,6 +537,152 @@ def _restore_group(client, group_data, parent=None, bundle_supplier=None, report
 def restore_backup(client, backup_data, bundle_supplier=None, report=None):
     for group in backup_data.get("groups", []):
         _restore_group(client, group, bundle_supplier=bundle_supplier, report=report)
+
+
+def _checkout_project_files(project_path, clone_url, git_env, dest_dir):
+    """Clone a project and copy the working tree (no .git dir) to dest_dir.
+
+    Returns True if files were written, False if the repository was empty.
+    """
+    _log("  cloning %s ..." % project_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clone_dir = os.path.join(tmpdir, "clone")
+        result = _run_git(["clone", clone_url, clone_dir], git_env)
+        if result.returncode != 0:
+            raise GitLabDRError(
+                "git clone failed for %s: %s" % (project_path, result.stderr.decode(errors="replace").strip())
+            )
+        ls = _run_git(["ls-files"], git_env, cwd=clone_dir)
+        if not ls.stdout.strip():
+            _log("  skipping %s (empty repository)" % project_path)
+            return False
+        os.makedirs(dest_dir, exist_ok=True)
+        for item in os.listdir(clone_dir):
+            if item == ".git":
+                continue
+            src = os.path.join(clone_dir, item)
+            dst = os.path.join(dest_dir, item)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+        file_count = len(ls.stdout.decode(errors="replace").strip().splitlines())
+        _log("  checked out %s (%d file(s))" % (project_path, file_count))
+        return True
+
+
+def _write_repo_files_to_dir(backup_data, base_url, token, dest_dir, cert=None, verify=True, report=None):
+    """Clone all project repos and write working tree files to dest_dir/repos/<full_path>/.
+
+    Each project is stored as plain files rather than a git bundle, making the
+    directory fully readable and transformable by text-processing tools such as
+    xsyncfar.  Git history is NOT preserved — see --repos-as-files for details.
+    """
+    git_env = _git_env(cert=cert, verify=verify)
+    stack = list(backup_data.get("groups", []))
+    while stack:
+        group_data = stack.pop(0)
+        for subgroup in group_data.get("subgroups", []):
+            stack.append(subgroup)
+        for project_data in group_data.get("projects", []):
+            details = project_data.get("details", {})
+            full_path = details.get("path_with_namespace") or details.get("path", "unknown")
+            clone_url = _git_clone_url(base_url, full_path, token)
+            project_dest = os.path.join(dest_dir, "repos", full_path)
+            try:
+                _checkout_project_files(full_path, clone_url, git_env, project_dest)
+            except GitLabDRError as exc:
+                msg = "skipping repo %s: %s" % (full_path, exc)
+                if report is not None:
+                    report.warn(msg)
+                else:
+                    _log("warning: " + msg)
+
+
+def _make_bundle_from_dir(source_dir, git_env):
+    """Create git bundle bytes from a plain files directory as a single initial commit.
+
+    This is used during restore of --repos-as-files backups to push the plain
+    files back to GitLab as a fresh repository.  All git history from the
+    original repository is lost.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = os.path.join(tmpdir, "repo")
+        shutil.copytree(source_dir, repo_dir)
+        env = git_env.copy()
+        env.setdefault("GIT_AUTHOR_NAME", "gitlab-dr")
+        env.setdefault("GIT_AUTHOR_EMAIL", "gitlab-dr@localhost")
+        env.setdefault("GIT_COMMITTER_NAME", "gitlab-dr")
+        env.setdefault("GIT_COMMITTER_EMAIL", "gitlab-dr@localhost")
+        _run_git(["init"], env, cwd=repo_dir)
+        _run_git(["symbolic-ref", "HEAD", "refs/heads/main"], env, cwd=repo_dir)
+        _run_git(["add", "."], env, cwd=repo_dir)
+        result = _run_git(
+            ["commit", "-m", "Restored by gitlab-dr (--repos-as-files): git history not preserved"],
+            env,
+            cwd=repo_dir,
+        )
+        if result.returncode != 0:
+            return None
+        bundle_path = os.path.join(tmpdir, "repo.bundle")
+        result = _run_git(["bundle", "create", bundle_path, "--all"], env, cwd=repo_dir)
+        if result.returncode != 0:
+            raise GitLabDRError("git bundle create failed: %s" % result.stderr.decode(errors="replace").strip())
+        with open(bundle_path, "rb") as fh:
+            return fh.read()
+
+
+def _make_files_supplier_dir(dir_path, git_env):
+    """Return a bundle supplier that builds a single-commit bundle from a plain-files directory.
+
+    Used during restore of --repos-as-files backups.  Each project is pushed as
+    a fresh repository with a single commit — git history from the original
+    source is not preserved.
+    """
+
+    def supplier(full_path):
+        project_dir = os.path.join(dir_path, "repos", full_path)
+        if not os.path.isdir(project_dir):
+            return None
+        return _make_bundle_from_dir(project_dir, git_env)
+
+    return supplier
+
+
+def write_backup_dir(dir_path, backup_data, repo_bundles_iter=None):
+    """Write a backup to a directory instead of a zip archive."""
+    os.makedirs(dir_path, exist_ok=True)
+    backup_json_path = os.path.join(dir_path, "backup.json")
+    with open(backup_json_path, "w", encoding="utf-8") as fh:
+        json.dump(backup_data, fh, indent=2, sort_keys=True)
+    if repo_bundles_iter:
+        for name, data in repo_bundles_iter:
+            bundle_path = os.path.join(dir_path, name)
+            os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
+            with open(bundle_path, "wb") as fh:
+                fh.write(data)
+
+
+def read_backup_dir(dir_path):
+    """Read a backup from a directory produced by write_backup_dir."""
+    backup_json_path = os.path.join(dir_path, "backup.json")
+    if not os.path.isfile(backup_json_path):
+        raise GitLabDRError("No backup.json found in directory: %s" % dir_path)
+    with open(backup_json_path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _make_bundle_supplier_dir(dir_path):
+    """Return a callable that reads a project's bundle from a backup directory."""
+
+    def supplier(full_path):
+        bundle_path = os.path.join(dir_path, "repos", full_path + ".bundle")
+        if not os.path.isfile(bundle_path):
+            return None
+        with open(bundle_path, "rb") as fh:
+            return fh.read()
+
+    return supplier
 
 
 def write_backup_archive(path, backup_data, repo_bundles_iter=None, encrypt=False, password=None):
