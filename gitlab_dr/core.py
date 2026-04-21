@@ -201,6 +201,24 @@ class GitLabClient(object):
             expected=(201,),
         )
 
+    def list_protected_branches(self, project_id):
+        return self._request("GET", "/projects/%s/protected_branches" % project_id)
+
+    def unprotect_branch(self, project_id, branch_name):
+        encoded = quote(branch_name, safe="")
+        self._request("DELETE", "/projects/%s/protected_branches/%s" % (project_id, encoded), expected=(204,))
+
+    def protect_branch(self, project_id, branch_name, push_access_level=40, merge_access_level=40):
+        payload = {
+            "name": branch_name,
+            "push_access_level": push_access_level,
+            "merge_access_level": merge_access_level,
+        }
+        try:
+            self._request("POST", "/projects/%s/protected_branches" % project_id, payload=payload, expected=(201,))
+        except GitLabDRError:
+            pass  # already protected — ignore
+
     def upsert_group_variable(self, group_id, variable):
         key = variable["key"]
         payload = {
@@ -252,24 +270,30 @@ def _git_env(cert=None, verify=True, token=None):
         env["GIT_SSL_CAINFO"] = verify
     elif not verify:
         env["GIT_SSL_NO_VERIFY"] = "1"
-    if token:
-        # Use Authorization: Bearer rather than embedding credentials in the URL.
-        # oauth2:<token>@ URL credentials fail on GitLab instances that validate
-        # tokens as JWTs (e.g. Keycloak OIDC). Bearer token auth is accepted by
-        # GitLab's git HTTP transport for PATs without going through OIDC.
-        count = int(env.get("GIT_CONFIG_COUNT", "0"))
-        env["GIT_CONFIG_COUNT"] = str(count + 1)
-        env["GIT_CONFIG_KEY_%d" % count] = "http.extraHeader"
-        env["GIT_CONFIG_VALUE_%d" % count] = "Authorization: Bearer %s" % token
+    # Disable credential helpers so git never prompts for credentials.
+    # Auth is embedded directly in the clone URL as git:<token>@.
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    env["GIT_CONFIG_COUNT"] = str(count + 2)
+    env["GIT_CONFIG_KEY_%d" % count] = "credential.helper"
+    env["GIT_CONFIG_VALUE_%d" % count] = ""
+    env["GIT_CONFIG_KEY_%d" % (count + 1)] = "http.useNetrc"
+    env["GIT_CONFIG_VALUE_%d" % (count + 1)] = "false"
     return env
 
 
 def _git_clone_url(base_url, project_path_with_namespace, token):
-    """Build a credential-free HTTPS git clone URL (auth is injected via http.extraHeader)."""
+    """Build an HTTPS git URL with credentials embedded as git:<token>@hostname.
+
+    The username 'git' is used instead of 'oauth2' because GitLab instances
+    fronted by Keycloak OIDC may validate 'oauth2' tokens as JWTs and reject
+    PATs.  Using 'git' as the username bypasses that path.
+    """
     parsed = urlparse(base_url)
     netloc = parsed.hostname
     if parsed.port:
         netloc += ":%d" % parsed.port
+    if token:
+        netloc = "git:%s@%s" % (token, netloc)
     path = "/%s.git" % project_path_with_namespace.lstrip("/")
     return urlunparse((parsed.scheme, netloc, path, "", "", ""))
 
@@ -506,6 +530,16 @@ def _restore_project(client, namespace_id, namespace_path, project_data, bundle_
             push_url = _git_clone_url(client.base_url, project.get("path_with_namespace", full_path), client.token)
             git_env = _git_env(cert=client.cert, verify=client.verify, token=client.token)
             _log("  pushing repo  %s ..." % full_path)
+            # Temporarily unprotect all protected branches so force-push succeeds
+            try:
+                protected = client.list_protected_branches(project_id)
+            except GitLabDRError:
+                protected = []
+            for pb in protected:
+                try:
+                    client.unprotect_branch(project_id, pb["name"])
+                except GitLabDRError:
+                    pass
             try:
                 _push_bundle(bundle_bytes, push_url, git_env)
                 _log("  pushed        %s" % full_path)
@@ -515,6 +549,15 @@ def _restore_project(client, namespace_id, namespace_path, project_data, bundle_
                     report.warn(msg)
                 else:
                     _log("warning: " + msg)
+            finally:
+                # Re-protect branches that were unprotected
+                for pb in protected:
+                    try:
+                        push_lvl = (pb.get("push_access_levels") or [{}])[0].get("access_level", 40)
+                        merge_lvl = (pb.get("merge_access_levels") or [{}])[0].get("access_level", 40)
+                        client.protect_branch(project_id, pb["name"], push_lvl, merge_lvl)
+                    except GitLabDRError:
+                        pass
 
 
 def _restore_group(client, group_data, parent=None, bundle_supplier=None, report=None):
