@@ -607,7 +607,14 @@ def _checkout_project_files(project_path, clone_url, git_env, dest_dir):
         ls = _run_git(["ls-files"], git_env, cwd=clone_dir)
         if not ls.stdout.strip():
             _log("  skipping %s (empty repository)" % project_path)
+            # Keep repeated backups deterministic by removing stale output.
+            if os.path.isdir(dest_dir):
+                shutil.rmtree(dest_dir)
             return False
+        # Ensure repeated backups into the same destination do not fail or
+        # leave stale files from previous runs.
+        if os.path.isdir(dest_dir):
+            shutil.rmtree(dest_dir)
         os.makedirs(dest_dir, exist_ok=True)
         for item in os.listdir(clone_dir):
             if item == ".git":
